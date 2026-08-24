@@ -25,3 +25,4 @@ _xyce.*
 
 # Formatting files
 .clang-format
+libactsim_*.a
