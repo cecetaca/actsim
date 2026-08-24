@@ -1136,6 +1136,39 @@ static Expr *expr_to_chp_expr (Expr *e, ActSimCore *s, int *flags)
   return ret;
 }
 
+/* Default statement delay for a process: sim.chp.<proc>.default_delay
+   if it exists, otherwise the global sim.chp.default_delay. Lets a
+   behavioural process contribute no delay (its latency being
+   characterised elsewhere) while the rest of the design -- channel
+   handshakes, queues, dispatch -- keeps real timing. Delay only:
+   a block modelled as instantaneous still burns energy. */
+static int _proc_default_delay (const stateinfo_t *si)
+{
+  char buf[1024];
+  char tmpbuf[900];
+  char *nsname = NULL;
+
+  if (!si || !si->bnl || !si->bnl->p) {
+    return config_get_int ("sim.chp.default_delay");
+  }
+  if (si->bnl->p->getns() != ActNamespace::Global()) {
+    nsname = si->bnl->p->getns()->Name();
+  }
+  if (nsname) {
+    snprintf (tmpbuf, 900, "%s::%s", nsname+2, si->bnl->p->getName());
+    FREE (nsname);
+  }
+  else {
+    snprintf (tmpbuf, 900, "%s", si->bnl->p->getName());
+  }
+  snprintf (buf, 1024, "sim.chp.%s.default_delay", tmpbuf);
+  if (config_exists (buf)) {
+    int d = config_get_int (buf);
+    return (d < 0) ? 0 : d;
+  }
+  return config_get_int ("sim.chp.default_delay");
+}
+
 // type -> 0 for delay, 1 for energy
 static int _get_detailed_costs (int &pos, int type, const stateinfo_t *si) 
 {
@@ -1226,7 +1259,7 @@ static chpsimstmt *gc_to_chpsim (act_chp_gc_t *gc, ActSimCore *s, const int anno
 
   NEW (ret, chpsimstmt);
   ret->type = CHPSIM_COND;
-  ret->delay_cost = (annotate_mode) ? _get_detailed_costs(dda_pos, 0, s->cursi()) : config_get_int ("sim.chp.default_delay");
+  ret->delay_cost = (annotate_mode) ? _get_detailed_costs(dda_pos, 0, s->cursi()) : _proc_default_delay (s->cursi());
   ret->energy_cost = (annotate_mode) ? _get_detailed_costs(dea_pos, 1, s->cursi()) : config_get_int ("sim.chp.default_energy");
   ret->bw_cost = 0;
   tmp = NULL;
@@ -1471,8 +1504,17 @@ static void _get_costs (stateinfo_t *si, ActId *id, chpsimstmt *stmt)
     }
   }
   else {
-    // default delay is 10
-    stmt->delay_cost = config_get_int ("sim.chp.default_delay");
+    /* Per-process default, then the global one. A behavioural model
+       often wants one process to contribute no delay at all (its
+       internals stand in for a block whose latency is characterised
+       elsewhere) while every other process keeps real timing. Without
+       this, the only way to do that is sim.chp.default_delay, which
+       silences the whole design -- including the channel handshakes
+       and queues that are usually the point of the model. Energy is
+       deliberately NOT given the same treatment: a block that is
+       modelled as taking no time still burns energy. */
+    // default delay is 10, unless this process overrides it
+    stmt->delay_cost = _proc_default_delay (si);
   }
 
   snprintf (buf, 1024, "sim.chp.%s.%s.D_bw", tmpbuf, tmpbuf2);
