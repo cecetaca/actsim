@@ -22,7 +22,9 @@ EXE=actsim.$(EXT)
 
 SUBDIRS=simlib
 TARGETS=$(EXE)
-TARGETINCS=actsim_ext.h
+LIB1=libactsim_$(EXT).a
+TARGETLIBS=$(LIB1)
+TARGETINCS=actsim_ext.h actsim.h state.h channel.h chpsim.h prssim.h xycesim.h
 TARGETINCSUBDIR=act
 
 OBJS=actsim.o core.o main.o \
@@ -42,5 +44,14 @@ include $(ACT_HOME)/scripts/Makefile.std
 
 $(EXE): $(OBJS) $(ACTPASSDEPEND) $(ACT_HOME)/lib/libtracelib.a
 	$(CXX) $(SH_EXE_OPTIONS) $(CFLAGS) $(OBJS) -o $(EXE) -lactannotate $(LIBACTPASS) $(LIBASIM) $(LIBACTSCMCLI) -ltracelib -lm -ldl -ledit $(LIBXYCE) -lz
+
+# simulator core as a static library for embedding (everything except the CLI);
+# consumers must provide glob_sim, debug_metrics, actsim_Act(), actsim_top(),
+# and is_rand_excl(), which are otherwise defined in main.cc
+LIBOBJS=$(filter-out main.o,$(OBJS))
+
+$(LIB1): $(LIBOBJS)
+	ar ruv $(LIB1) $(LIBOBJS)
+	$(RANLIB) $(LIB1)
 
 -include Makefile.deps
