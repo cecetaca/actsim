@@ -26,6 +26,7 @@
 #include <dlfcn.h>
 #include <common/pp.h>
 #include <sstream>
+#include <unordered_map>
 
 class ChpSim;
 
@@ -2415,6 +2416,73 @@ BigInt ChpSim::funcEval (Function *f, int nargs, void **vargs)
   BigInt *x;
   expr_multires *xm;
   BigInt ret;
+
+  /*
+   * gem5-act: an EXTERNAL function has no CHP body, so none of the
+   * local-state scaffolding below is ever read -- the arguments are
+   * handed to the native callee straight out of `vargs`, and `self`
+   * never exists. Building it anyway costs a hash table, a
+   * heap-allocated BigInt per local, several dynamic_casts and a
+   * matching teardown on EVERY call. The symbol lookup was also
+   * repeated per call, and act_find_dl_func ends in a dlsym() whose
+   * export-trie walk is not cheap; its result depends only on the
+   * Function, which cannot change during a run.
+   *
+   * Measured on a design that calls an external function per element
+   * (`sample` on a running simulation): funcEval was 36% of total
+   * runtime and the dlsym alone 6%.
+   */
+  if (f->isExternal()) {
+    static std::unordered_map<Function *, EXTFUNC> _extcache;
+    EXTFUNC extcall;
+
+    auto hit = _extcache.find (f);
+    if (hit != _extcache.end()) {
+      extcall = hit->second;
+    }
+    else {
+      if (!_chp_ext) {
+        _chp_ext = act_read_extern_table ("sim.extern");
+      }
+      extcall = (EXTFUNC) act_find_dl_func (_chp_ext, f->getns(), f->getName());
+      if (!extcall) {
+        fatal_error ("Function `%s%s' missing chp body as well as external definition.",
+                     f->getns() == ActNamespace::Global() ? "" :
+                     f->getns()->Name(true) + 2,
+                     f->getName());
+      }
+      _extcache[f] = extcall;
+    }
+
+    if (nargs != f->getNumPorts()) {
+      fatal_error ("Function `%s': invalid number of arguments", f->getName());
+    }
+
+    expr_res *extargs = NULL;
+    expr_res extret;
+    if (nargs > 0) {
+      MALLOC (extargs, expr_res, nargs);
+      for (int i=0; i < nargs; i++) {
+        if (TypeFactory::isStructure (f->getPortType (i))) {
+          fatal_error ("External function calls cannot have structure arguments");
+        }
+        if (f->getPortType (i)->arrayInfo()) {
+          fatal_error ("External function calls cannot have array arguments");
+        }
+        extargs[i].width = ((BigInt *)vargs[i])->getWidth ();
+        extargs[i].v = ((BigInt *)vargs[i])->getVal (0);
+      }
+    }
+    extret = (*extcall) (nargs, extargs);
+    if (nargs > 0) {
+      FREE (extargs);
+    }
+    BigInt tmp;
+    tmp.setWidth (extret.width);
+    tmp.setVal (0, extret.v);
+    return tmp;
+  }
+
   ActInstiter it(f->CurScope());
 
   /*-- allocate state and bindings --*/
@@ -2468,62 +2536,7 @@ BigInt ChpSim::funcEval (Function *f, int nargs, void **vargs)
     }
   }
 
-  /* --- run body -- */
-  if (f->isExternal()) {
-    EXTFUNC extcall = NULL;
-
-    if (!_chp_ext) {
-      _chp_ext = act_read_extern_table ("sim.extern");
-    }
-    extcall = (EXTFUNC) act_find_dl_func (_chp_ext, f->getns(), f->getName());
-
-    if (!extcall) {
-      fatal_error ("Function `%s%s' missing chp body as well as external definition.",
-		   f->getns() == ActNamespace::Global() ? "" :
-		   f->getns()->Name(true) + 2,
-		   f->getName());
-    }
-
-    expr_res *extargs = NULL;
-    expr_res extret;
-    if (nargs > 0) {
-      MALLOC (extargs, expr_res, nargs);
-      for (int i=0; i < nargs; i++) {
-	if (TypeFactory::isStructure (f->getPortType (i))) {
-	  fatal_error ("External function calls cannot have structure arguments");
-	}
-	if (f->getPortType (i)->arrayInfo()) {
-	  fatal_error ("External function calls cannot have array arguments");
-	}
-	extargs[i].width = ((BigInt *)vargs[i])->getWidth ();
-	extargs[i].v = ((BigInt *)vargs[i])->getVal (0);
-      }
-    }
-    extret = (*extcall) (nargs, extargs);
-    if (nargs > 0) {
-      FREE (extargs);
-    }
-    BigInt tmp;
-    tmp.setWidth (extret.width);
-    tmp.setVal (0, extret.v);
-
-    hash_iter_init (lstate, &iter);
-    while ((b = hash_iter_next (lstate, &iter))) {
-      ValueIdx *vx = f->CurScope()->LookupVal (b->key);
-      Assert (vx, "How is this possible?");
-      if (TypeFactory::isStructure (vx->t)) {
-	((expr_multires *)b->v)->~expr_multires();
-      }
-      else {
-	((BigInt *)b->v)->~BigInt();
-      }
-      FREE (b->v);
-    }
-    hash_free (lstate);
-    
-    return tmp;
-  }
-  
+  /* --- run body (external functions returned above) -- */
   act_chp *c = f->getlang()->getchp();
   Scope *_tmp = _cureval;
   stack_push (_statestk, lstate);
